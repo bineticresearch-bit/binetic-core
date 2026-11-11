@@ -34,6 +34,19 @@ reservoir dynamics (lag-1 autocorrelation −0.34 from queuing
 compensation). A **mirror triangulation** technique is shown to cancel
 99% of the switch's timing noise.
 
+The central hardware result is a **closed-loop reservoir** through the
+switch: the readout's own prediction rides the packet payload back into
+the data plane, where the switch multiplies it with the input in silicon,
+and the receipt returns the product to the readout. On NARMA-10 this
+closed loop reaches NMSE 0.015–0.021 across unseen seeds — an 8×
+improvement over the input-only floor that no input-only state can
+cross, and 30× better than a 200-node echo-state network. We show the
+floor is structural (NARMA's target depends on $y(t-1)$, which no
+function of the inputs contains) and that the loop breaks it exactly
+where claimed: the state then contains $y(t-1)$ and
+$u(t-1)y(t-1)$, and a linear readout on that state predicts at NMSE
+0.0000 in software and 0.0155 through the physical switch.
+
 ---
 
 ## 1. The problem with delay lines
@@ -183,6 +196,18 @@ record this as a property of input-only direct-$k$ rather than patch it.
   mixings.
 - **More lanes of the same shape**: 32→128 lanes halved the error, but
   128→256 barely moved. Width saturates; depth/evolution does not.
+- **Single-register cross-packet recurrence as a reservoir.** The
+  cascade register (§6.2) is a genuine cross-packet recurrence, bit-exact
+  — but its increments recover the input at correlation 1.000, i.e. it is
+  a pure integrator and contributes no nonlinearity. A recurrence in one
+  variable cannot mix two independent inputs.
+- **6-bit closed loop.** Feeding the readout's output back through a
+  63-level field gives no recurrence information: true-$y$ and $\hat{y}$
+  feedback produce identical results (0.1073 vs 0.1076) because
+  quantization destroys the signal. Widening to 16 bits fixed it (§6.1).
+- **Timing as the state channel.** Correlation −0.01 to 0.72 with the
+  input across runs, non-stationary. Relegated to an auxiliary
+  observable; the payload carries the signal.
 
 ## 6. The network as substrate
 
@@ -227,23 +252,111 @@ software switch.
    arrives verbatim (100% exact on 300 packets). The returned packet is
    thus a signed record of the transit: the input preserved, and the
    network's computation appended.
+6. **The switch's mix register supplies nonlinearity a readout cannot
+   synthesize.** With two input streams carried in separate packet
+   fields, the switch computes their product in silicon. The mix field
+   agrees with a software computation of $u_{t-1}v_{t-1}$ on **100.0%**
+   of packets. A readout *with* the mix term predicts the delayed
+   product at NMSE **0.0000** versus 0.1515 without it — the formal
+   criterion for the substrate contributing nonlinear computation.
+7. **A single switch mix register beats a 16-tap delay line on NARMA-10.**
+   The register alone predicts at NMSE 0.117, where a 16-tap window of
+   raw input history floors at 0.165. The nonlinearity is worth more
+   than the memory.
+
+### 6.1 The closed-loop reservoir
+
+The decisive hardware experiment. NARMA-10's target depends on
+$y(t-1)$, which no function of the inputs contains — every input-only
+readout floors at ~0.10–0.12 (verified four ways: software cross-term
+0.097, switch mix register 0.117, evolved lattice 0.110, delay line
+0.165). The loop closes this by feeding the readout's own previous
+prediction back into the data plane as a third packet field, so the
+switch computes
+
+$$\text{mix}_{uf} = u(t-1) \cdot \hat{y}(t-1)$$
+
+— the NARMA recurrence term with $\hat{y}$ standing in for $y$, computed
+in switch silicon at line rate.
+
+| Configuration | NMSE |
+|---|---|
+| Open-loop (pinned feedback, 16-bit) | 0.6719 |
+| **Closed-loop ($\hat{y}$ fed back, 16-bit)** | **0.0204** |
+| Closed-loop (true $y$ — the ceiling) | 0.0155 |
+| Input-only floor (delay line) | 0.165 |
+| 200-node ESN (software) | 0.546 |
+
+**The floor breaks by 8×.** Across three unseen seeds the closed loop
+scores 0.0185 / 0.0212 / 0.0146, consistently within 30–70% of the
+true-$y$ ceiling. Two findings made it work, and both are measured:
+
+**Field width was the binding constraint.** At 6 bits (IP DSCP, 63
+levels) true-$y$ feedback and $\hat{y}$ feedback give *identical*
+results (0.1073 vs 0.1076) — quantization destroys the recurrence
+information before the loop can use it. Widening to 16 bits (two payload
+bytes, 65,535 levels) opens the loop: the same experiment then moves
+from 0.1076 to 0.0204. The packet field is the register file, and it
+runs out of precision exactly where recurrence information lives.
+
+**The readout must be trained on the loop's operating distribution.**
+Training on pinned or random feedback puts the features outside the
+region the closed loop visits, and the fit extrapolates and diverges
+(we measured NMSE 1229 from this alone, with loop gain a stable 0.113 —
+the divergence was a training artifact, not instability). Training on
+receipts collected with true-$y$ feedback puts the features where the
+loop operates, and the loop then runs to convergence.
+
+**Verification.** The receipt's $f\_prev$ field matches the sent
+feedback bit-exactly, lag-1 (e.g. sent 10472, receipt 10472). A
+software-perfect state containing $y(t-1)$ and both mixings predicts at
+NMSE 0.0000, isolating the channel; the physical loop delivers 0.0155,
+so the switch recovers essentially all of the available information.
+
+### 6.2 Program evolution
+
+The data-plane program itself is made evolvable. The genome
+parameterizes a fixed P4 skeleton (recurrence operation, shift
+constants, which register feeds back, which fields land in the receipt),
+so every instance compiles by construction. Compile takes 0.22s and a
+runtime hot-swap 0.03s, giving a full program-reload cycle of 0.25s —
+fast enough to evolve against physical measurements on the device.
+
+Measured on this loop: a sweep over four recurrence operations
+(mul / add / xor / shift-mul) at two shift constants showed all
+single-register recurrences are **linear** — the accumulator's increments
+recover the input at correlation 1.000, bit-exact, but generate no
+mixings (NMSE 6–9 on $u(t)u(t-1)$ across all ops). A single-register
+recurrence in one variable cannot produce a function of two independent
+inputs. This is the structural reason the two-register mix construction
+of §6 items 6–7 is required, and it constrains the genome family:
+useful programs combine at least two independently-fed registers.
 
 ### Limitations, stated plainly
 
-- **A software switch is a poor reservoir.** Its timing noise is
+- **A software switch is a poor timing reservoir.** Its timing noise is
   non-stationary — identical inputs gave correlations 0.35 / 0.48 / 0.72
-  across three runs, with noise std varying 2×. The live-channel NARMA
-  NMSE is 1.05 against an oracle of 0.174. The software lattice
-  outperforms the physical channel here by ~27×, which is itself the
-  clearest evidence that the lattice is doing real work.
-- **Timing should not carry the signal.** At ~0.3 correlation per packet
-  and 1.3 ms noise, one analog value per packet is insufficient. The
-  payload (12,000 bits, noiseless) is the correct channel for the input;
-  timing's role is as a *transformed* observable that provides the
-  reservoir dynamics.
-- **100% transfer is not demonstrated.** Evolved geometry is
-  task-specific; a geometry evolved for NARMA-30 does not transfer to
-  frequency discrimination without re-evolution.
+  across three runs, with noise std varying 2×. Timing alone is not a
+  usable state channel: the live timing-channel NARMA NMSE is 1.05
+  against an oracle of 0.174. The payload, not timing, carries the
+  signal; timing's role is as a *transformed* observable.
+- **The closed loop is not a single streaming pass.** The readout runs
+  on a host, step by step, injecting each prediction as the next
+  packet's feedback field. The substrate computation (the mix register)
+  runs at line rate in silicon, but the loop as a whole is not yet a
+  single streaming inference. Making it one is an engineering matter.
+- **BMv2 is software.** All hardware results are measured on a software
+  switch. On real silicon (Tofino, NetFPGA) the timing noise would be
+  stationary and bounded rather than host-schedule-dominated; we expect
+  the timing channel to be substantially more informative there. This
+  is untested.
+- **Geometry is task-specific.** A geometry evolved for NARMA-30 does
+  not transfer to frequency discrimination without re-evolution.
+- **Single-register recurrences are linear.** Measured across four
+  operations: a one-register recurrence in one variable cannot produce
+  mixings of two independent inputs (§6.2). Useful programs require at
+  least two independently-fed registers, which constrains the program
+  genome family.
 
 ## 7. The binetic package
 
@@ -275,15 +388,27 @@ assessment of each:
 - **Universal geometry.** Evolved geometries are task-specific. Does a
   geometry exist that transfers across task families, or is the wiring
   necessarily task-bound? Unknown.
-- **Timing as dynamics, not transport.** The live measurements suggest
-  timing's role is to provide nonlinear channel dynamics while the
-  payload carries the signal cleanly. The composition
-  `[payload | receipt | timing]` as a joint state is implemented but not
-  yet benchmarked end-to-end.
+- **Timing as dynamics, not transport.** The live measurements show
+  timing alone is a poor state channel (non-stationary noise) but does
+  carry genuine dynamics (lag-1 autocorrelation −0.34). The composition
+  `[payload | receipt | timing]` as a joint state is the natural next
+  experiment: payload carries the signal, the mix register supplies the
+  nonlinearity, and timing supplies an additional nonlinear observable
+  that the lattice can mix.
 - **Real hardware.** All live measurements are BMv2 (software). On a
   hardware switch with stationary, bounded queueing noise, we expect the
-  mirror-triangulated timing channel to be far more informative; this is
-  untested.
+  mirror-triangulated timing channel and the closed loop to be
+  substantially tighter; this is untested and is the obvious next step.
+- **Co-evolution across the stack.** §6.2 evolves the data-plane program
+  against readout error, and §4 evolves the geometry. These currently
+  run separately. Co-evolving the *program* and the *readout* jointly —
+  with the physical switch in the fitness loop — is implemented in
+  prototype (0.25s per program reload) but not yet run as a joint search.
+- **Field width as a design dimension.** The closed loop only works at
+  ≥16 bits of feedback; 6 bits quantizes away the recurrence. This makes
+  field width a first-class design parameter of the substrate. IPv6's
+  flow label (20 bits) and multi-byte payload fields are the natural
+  extension, and the precision/resolution trade-off is unstudied.
 - **Deeper nesting, done properly.** Our nested-lattice test refuted a
   weak version of the idea (bit-sliced bands). A true tensor nesting,
   where each lattice element expands into a full lattice, is
